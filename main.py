@@ -8,8 +8,8 @@ import time
 import os
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
-from utils import split_data, load_data_geometric, plot_accu_graph, plot_loss_graph
-from models.graphcnn import GraphCNN
+from utils import split_data, load_data_geometric, plot_accu_graph, plot_loss_graph, write_10_fold_result, print_args
+from models.graphegin import GraphEGIN
 
 criterion = nn.CrossEntropyLoss()
 
@@ -40,7 +40,7 @@ def train(model, device, train_graphs, optimizer):
     return average_loss
 
 
-def test(model, train_graphs, test_graphs):
+def val(model, train_graphs, val_graphs):
     model.eval()
 
     output = []
@@ -59,20 +59,20 @@ def test(model, train_graphs, test_graphs):
 
     output = []
     labels = []
-    for batch in test_graphs:
+    for batch in val_graphs:
         output.append(model(batch))
         labels.append(batch.y)
 
     output = torch.cat(output, 0)
     labels = torch.cat(labels, 0)
-    num_test_graph = len(labels)
-    test_loss = criterion(output, labels).detach().cpu().numpy()
+    num_val_graph = len(labels)
+    val_loss = criterion(output, labels).detach().cpu().numpy()
 
     pred = output.max(1, keepdim=True)[1]
     correct = pred.eq(labels.view_as(pred)).sum().cpu().item()
-    acc_test = correct / float(num_test_graph)
+    acc_val = correct / float(num_val_graph)
 
-    return acc_train, acc_test, test_loss
+    return acc_train, acc_val, val_loss
 
 
 def main(args):
@@ -84,23 +84,26 @@ def main(args):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(0)
 
-    # recommend to use cpu if no eps and gpu if learn eps.
+    # Recommendation device: cpu if no eps / gpu if learn eps.
     if not args.learn_eps:
         device = 'cpu'
 
     graphs, num_classes = load_data_geometric(args.dataset)
-    train_idx, test_idx = split_data(graphs, args.dataset, args.fold_index)
+    train_idx, val_idx = split_data(graphs, args.dataset, args.fold_index)
 
     train_loader = DataLoader(graphs[train_idx.tolist()], batch_size=args.batch_size, shuffle=True)
-    test_loader = DataLoader(graphs[test_idx.tolist()], batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(graphs[val_idx.tolist()], batch_size=args.batch_size, shuffle=True)
 
-    model = GraphCNN(args.num_layers, args.num_mlp_layers, graphs.num_edge_features, graphs.num_node_features,
-                     args.hidden_dim, num_classes, args.final_dropout, args.learn_eps, device).to(device)
-    print(args)
+    model = GraphEGIN(args.num_layers, args.num_mlp_layers, graphs.num_edge_features, graphs.num_node_features,
+                      args.hidden_dim, num_classes, args.final_dropout, args.learn_eps, device).to(device)
+
+    print_args(args)
+
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
     pbar = tqdm(range(args.epochs), unit='epochs', file=sys.stdout)
     date = str(time.strftime("%m_%d_%H_%M", time.localtime()))
+
     if args.learn_eps:
         path = 'result/{}/eps/'.format(args.dataset)
     else:
@@ -115,40 +118,43 @@ def main(args):
                 f.write(str(element) + " = " + str(args.__dict__[element]) + '\n')
             f.write("==============================================================================================\n")
 
-    best_test_acc = 0
+    best_val_acc = 0
     all_train_loss = []
-    all_test_loss = []
+    all_val_loss = []
     all_train_acc = []
-    all_test_acc = []
+    all_val_acc = []
 
     for epoch in pbar:
         avg_loss = train(model, device, train_loader, optimizer)
         scheduler.step()
-        acc_train, acc_test, test_loss = test(model, train_loader, test_loader)
-        if acc_test > best_test_acc:
-            best_test_acc = acc_test
-        tqdm.write("epoch: %d, train loss = %.6f, test loss = %.6f, train acc = %.2f%% , test acc = %.2f%%" % (
-        epoch, avg_loss, test_loss, acc_train * 100, acc_test * 100))
+        acc_train, acc_val, val_loss = val(model, train_loader, val_loader)
+        if acc_val > best_val_acc:
+            best_val_acc = acc_val
+        if epoch % 5 == 0 and args.print_console:
+            tqdm.write("epoch: %d, train loss = %.6f, val loss = %.6f, train acc = %.2f%% , val acc = %.2f%%" % (
+        epoch, avg_loss, val_loss, acc_train * 100, acc_val * 100))
         if args.output_file:
             with open(path + date + '_acc_results.txt', 'a+') as f:
-                f.write("epoch: %d, train loss = %.4f, test loss = %.4f, train acc = %.2f%% , test acc = %.2f%%\n" % (
-                    epoch, avg_loss, test_loss, acc_train * 100, acc_test * 100))
+                f.write("epoch: %d, train loss = %.6f, val loss = %.6f, train acc = %.2f%% , val acc = %.2f%%\n" % (
+                    epoch, avg_loss, val_loss, acc_train * 100, acc_val * 100))
 
         all_train_loss.append(avg_loss)
-        all_test_loss.append(test_loss)
+        all_val_loss.append(val_loss)
         all_train_acc.append(acc_train * 100)
-        all_test_acc.append(acc_test * 100)
+        all_val_acc.append(acc_val * 100)
 
     if args.plot_curve:
-        plot_loss_graph(all_train_loss, all_test_loss, date, path)
-        plot_accu_graph(all_train_acc, all_test_acc, date, path)
+        plot_loss_graph(all_train_loss[1:], all_val_loss[1:], date, path)
+        plot_accu_graph(all_train_acc, all_val_acc, date, path)
 
-    return best_test_acc
+    print("best val acc: {} ".format(best_val_acc))
+
+    return best_val_acc
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='PyTorch graph convolutional neural net for whole-graph classification')
+        description='PyTorch EGIN implementation for graph classification')
     parser.add_argument('--dataset', type=str, default="MUTAG",
                         help='name of dataset (default: MUTAG)')
     parser.add_argument('--device', type=int, default=0,
@@ -162,7 +168,7 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=0,
                         help='random seed for splitting the dataset into 10 (default: 0)')
     parser.add_argument('--fold_index', type=int, default=0,
-                        help='the index (0-9) of fold in 10-fold validation. -1:create indexes. 10: run all 10-fold')
+                        help='the index (0-9) of fold in 10-fold validation. -1: create indexes / 10: run all 10-fold')
     parser.add_argument('--num_layers', type=int, default=5,
                         help='number of layers INCLUDING the input one (default: 5)')
     parser.add_argument('--num_mlp_layers', type=int, default=2,
@@ -179,15 +185,16 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     # =======================================================================================================
-    # specify parameters for testing purpose
-    args.dataset = 'MUTAG'
-    args.epochs = 300
-    args.batch_size = 16
-    args.lr = 0.001
-    args.fold_index = 10
+    # specify parameters manually here without using command line.
+    args.dataset = 'ER_MD'
+    args.epochs = 200
+    args.batch_size = 32
+    args.lr = 0.005
+    args.fold_index = 2
     args.learn_eps = False
     args.output_file = True
     args.plot_curve = True
+    args.print_console = True
     # =======================================================================================================
 
     best_acc = []
@@ -195,8 +202,10 @@ if __name__ == '__main__':
         for i in range(10):
             args.fold_index = i
             best_acc.append(main(args))
-        mean = np.mean(best_acc)
-        std_dev = np.std(best_acc)
-        print("10-fold mean:{}, std_dev:{}".format(mean,std_dev))
+        print("10-fold mean:{}, std_dev:{}".format(np.mean(best_acc),np.std(best_acc)))
+
+        if args.output_file:
+            write_10_fold_result(args, best_acc)
+
     else:
         main(args)
