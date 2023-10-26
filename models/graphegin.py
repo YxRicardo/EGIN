@@ -8,7 +8,7 @@ from mlp import MLP
 import copy
 
 class GraphEGIN(nn.Module):
-    def __init__(self, num_layers, num_mlp_layers, num_edge_feat, input_dim, hidden_dim, output_dim, final_dropout, learn_eps,  device):
+    def __init__(self, num_layers, num_mlp_layers, num_edge_feat, input_dim, hidden_dim, output_dim, final_dropout, learn_eps,  dot_update, device):
         '''
             num_layers: number of layers in the neural networks (INCLUDING the input layer)
             num_mlp_layers: number of layers in mlps (EXCLUDING the input layer)
@@ -23,7 +23,7 @@ class GraphEGIN(nn.Module):
         '''
 
         super(GraphEGIN, self).__init__()
-
+        self.dot_update = dot_update
         self.final_dropout = final_dropout
         self.device = device
         self.num_layers = num_layers
@@ -33,17 +33,29 @@ class GraphEGIN(nn.Module):
         ###List of MLPs
         self.mlps = torch.nn.ModuleList()
         self.adj = None
+        self.edge_rep = None
+        self.edge_unit = None
 
         ###List of batchnorms applied to the output of MLP (input of the final prediction linear layer)
         self.batch_norms = torch.nn.ModuleList()
 
-        for layer in range(self.num_layers-1):
-            if layer == 0:
-                self.mlps.append(MLP(num_mlp_layers, input_dim * num_edge_feat, hidden_dim, hidden_dim))
-            else:
-                self.mlps.append(MLP(num_mlp_layers, hidden_dim * num_edge_feat, hidden_dim, hidden_dim))
+        if not self.dot_update:
+            for layer in range(self.num_layers-1):
+                if layer == 0:
+                    self.mlps.append(MLP(num_mlp_layers, input_dim * num_edge_feat, hidden_dim, hidden_dim))
+                else:
+                    self.mlps.append(MLP(num_mlp_layers, hidden_dim * num_edge_feat, hidden_dim, hidden_dim))
 
-            self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
+                self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
+
+        else:
+            for layer in range(self.num_layers - 1):
+                if layer == 0:
+                    self.mlps.append(MLP(num_mlp_layers, input_dim + num_edge_feat, hidden_dim, hidden_dim))
+                else:
+                    self.mlps.append(MLP(num_mlp_layers, hidden_dim + num_edge_feat, hidden_dim, hidden_dim))
+
+                self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
 
 
         #Linear function that maps the hidden representation at dofferemt layers into a prediction score
@@ -55,10 +67,12 @@ class GraphEGIN(nn.Module):
                 self.linears_prediction.append(nn.Linear(hidden_dim, output_dim))
 
 
+
     def __batch_to_embedadj(self,batch):
         if batch.num_edge_features == 0:
             raise Exception("No edge feature in this dataset. Add (-egin false) to execute original GIN model")
-        elif batch.num_edge_features == 1:
+
+        if batch.num_edge_features == 1:
             adj = torch.eye(batch.num_nodes, batch.num_nodes)
         else:
             adj = torch.zeros(batch.num_nodes, batch.num_nodes, batch.num_edge_features)
@@ -66,6 +80,16 @@ class GraphEGIN(nn.Module):
                 adj[i][i] = torch.ones(batch.num_edge_features)
         for i in range(batch.num_edges):
             adj[batch.edge_index[0][i]][batch.edge_index[1][i]] = batch.edge_attr[i]
+
+        if self.dot_update:
+            self.edge_rep = torch.sum(adj,dim=1).to(self.device)
+
+            adj = torch.eye(batch.num_nodes, batch.num_nodes)
+            for i in range(batch.num_edges):
+                adj[batch.edge_index[0][i]][batch.edge_index[1][i]] = 1
+
+            if self.learn_eps:
+                self.edge_unit = torch.ones(batch.num_nodes,batch.num_edge_features).to(self.device)
 
         self.adj = adj.to(self.device)
 
@@ -79,34 +103,14 @@ class GraphEGIN(nn.Module):
         return h
 
 
-    def next_layer_eps(self, h, layer, padded_neighbor_list = None, Adj_block = None):
-        ###pooling neighboring nodes and center nodes separately by epsilon reweighting.
-
-        if self.neighbor_pooling_type == "max":
-            ##If max pooling
-            pooled = self.maxpool(h, padded_neighbor_list)
-        else:
-            #If sum or average pooling
-            pooled = torch.spmm(Adj_block, h)
-            if self.neighbor_pooling_type == "average":
-                #If average pooling
-                degree = torch.spmm(Adj_block, torch.ones((Adj_block.shape[0], 1)).to(self.device))
-                pooled = pooled/degree
-
-        #Reweights the center node representation when aggregating it with its neighbors
-        pooled = pooled + (1 + self.eps[layer])*h
-        pooled_rep = self.mlps[layer](pooled)
-        h = self.batch_norms[layer](pooled_rep)
-
-        #non-linearity
-        h = F.relu(h)
-        return h
-
 
     def egin_next_layer(self, h, layer):
+        if not self.dot_update:
         ###pooling neighboring nodes and center nodes altogether
+            pooled = self.embedadj_mm(self.adj, h)
 
-        pooled = self.embedadj_mm(self.adj, h)
+        else:
+            pooled = torch.cat((torch.spmm(self.adj, h), self.edge_rep),dim=1)
 
         # representation of neighboring and center nodes
         pooled_rep = self.mlps[layer](pooled)
@@ -117,25 +121,21 @@ class GraphEGIN(nn.Module):
         h = F.relu(h)
         return h
 
-    def expand_h(self,h):
-        h_expand = torch.zeros(h.shape[0],h.shape[1]*self.num_edge_feat)
-        for i in range(h.shape[0]):
-            for j in range(h.shape[1]):
-                for k in range(self.num_edge_feat):
-                    h_expand[i][k + j * self.num_edge_feat] = h[i][j]
-
-        return h_expand
 
     def egin_next_layer_eps(self, h, layer, batch):
         ###pooling neighboring nodes and center nodes altogether
-        adj = copy.deepcopy(self.adj)
-        if batch.num_edge_features == 1:
-            adj = adj + torch.eye(batch.num_nodes, batch.num_nodes).to(self.device) * self.eps[layer]
-        else:
-            for i in range(batch.num_nodes):
-                adj[i][i] = adj[i][i] + torch.ones(batch.num_edge_features).to(self.device) * self.eps[layer]
+        if not self.dot_update:
+            adj = copy.deepcopy(self.adj)
+            if batch.num_edge_features == 1:
+                adj = adj + torch.eye(batch.num_nodes, batch.num_nodes).to(self.device) * self.eps[layer]
+            else:
+                for i in range(batch.num_nodes):
+                    adj[i][i] = adj[i][i] + torch.ones(batch.num_edge_features).to(self.device) * self.eps[layer]
 
-        pooled = self.embedadj_mm(adj, h)
+            pooled = self.embedadj_mm(adj, h)
+
+        else:
+            pooled = torch.cat((torch.spmm(self.adj, h), self.edge_rep), dim=1) + torch.cat((h,self.edge_unit),dim=1) * self.eps[layer]
 
         pooled_rep = self.mlps[layer](pooled)
 

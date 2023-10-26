@@ -10,6 +10,7 @@ from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 from utils import split_data, load_data_geometric, plot_accu_graph, plot_loss_graph, write_10_fold_result, print_args
 from models.graphegin import GraphEGIN
+import random
 
 criterion = nn.CrossEntropyLoss()
 
@@ -76,9 +77,11 @@ def val(model, train_graphs, val_graphs):
 
 
 def main(args):
-    # set up seeds and gpu device
-    torch.manual_seed(0)
-    np.random.seed(0)
+    seed = args.seed
+
+    random.seed(seed)  # set random seed to reproduce result
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
     device = torch.device("cuda:" + str(args.device)) if torch.cuda.is_available() else torch.device("cpu")
     if torch.cuda.is_available():
@@ -95,7 +98,7 @@ def main(args):
     val_loader = DataLoader(graphs[val_idx.tolist()], batch_size=args.batch_size, shuffle=True)
 
     model = GraphEGIN(args.num_layers, args.num_mlp_layers, graphs.num_edge_features, graphs.num_node_features,
-                      args.hidden_dim, num_classes, args.final_dropout, args.learn_eps, device).to(device)
+                      args.hidden_dim, num_classes, args.final_dropout, args.learn_eps, args.dot_update, device).to(device)
 
     print_args(args)
 
@@ -105,9 +108,15 @@ def main(args):
     date = str(time.strftime("%m_%d_%H_%M", time.localtime()))
 
     if args.learn_eps:
-        path = 'result/{}/eps/'.format(args.dataset)
+        if not args.dot_update:
+            path = 'result/{}/eps/'.format(args.dataset)
+        else:
+            path = 'result/{}/eps/dot/'.format(args.dataset)
     else:
-        path = 'result/{}/no_eps/'.format(args.dataset)
+        if not args.dot_update:
+            path = 'result/{}/no_eps/'.format(args.dataset)
+        else:
+            path = 'result/{}/no_eps/dot/'.format(args.dataset)
 
     if args.output_file:
         isExists = os.path.exists(path)
@@ -159,16 +168,16 @@ if __name__ == '__main__':
                         help='name of dataset (default: MUTAG)')
     parser.add_argument('--device', type=int, default=0,
                         help='which gpu to use if any (default: 0)')
-    parser.add_argument('--batch_size', type=int, default=16,
+    parser.add_argument('--batch_size', type=int, default=32,
                         help='input batch size for training (default: 32)')
-    parser.add_argument('--epochs', type=int, default=150,
-                        help='number of epochs to train (default: 350)')
+    parser.add_argument('--epochs', type=int, default=200,
+                        help='number of epochs to train (default: 200)')
+    parser.add_argument('--seed', type=int, default=-1,
+                        help='random seed for training, -1: random')
     parser.add_argument('--lr', type=float, default=0.01,
                         help='learning rate (default: 0.01)')
-    parser.add_argument('--seed', type=int, default=0,
-                        help='random seed for splitting the dataset into 10 (default: 0)')
     parser.add_argument('--fold_index', type=int, default=0,
-                        help='the index (0-9) of fold in 10-fold validation. -1: create indexes / 10: run all 10-fold')
+                        help='the index (0-9) of fold in 10-fold validation. 0: create indexes if does not exist / 10: run all 10-fold')
     parser.add_argument('--num_layers', type=int, default=5,
                         help='number of layers INCLUDING the input one (default: 5)')
     parser.add_argument('--num_mlp_layers', type=int, default=2,
@@ -177,6 +186,7 @@ if __name__ == '__main__':
                         help='number of hidden units (default: 64)')
     parser.add_argument('--final_dropout', type=float, default=0.5,
                         help='final layer dropout (default: 0.5)')
+    parser.add_argument('--dot_update', default=False, help='apply dot update function')
     parser.add_argument('--learn_eps', action="store_true",
                         help='Whether to learn the epsilon weighting for the center nodes. Does not affect training accuracy though.')
     parser.add_argument('--print_console', default=False, help='print result of each epoch on console')
@@ -185,17 +195,24 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     # =======================================================================================================
-    # specify parameters manually here without using command line.
-    args.dataset = 'ER_MD'
+    # specify parameters here manually without using command line.
+    # 'Cuneiform','ER_MD','AIDS'
+    args.dataset = 'MUTAG'
     args.epochs = 200
-    args.batch_size = 32
+    args.batch_size = 64
     args.lr = 0.005
-    args.fold_index = 2
+    args.fold_index = 10
     args.learn_eps = False
     args.output_file = True
     args.plot_curve = True
     args.print_console = True
+    args.num_layers = 5
+    args.hidden_dim = 32
+    args.dot_update = False
     # =======================================================================================================
+
+    if args.seed == -1:
+        args.seed = random.randint(0, 100000)
 
     best_acc = []
     if args.fold_index == 10:
