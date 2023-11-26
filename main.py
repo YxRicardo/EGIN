@@ -8,9 +8,10 @@ import time
 import os
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
-from utils import split_data, load_data_geometric, plot_accu_graph, plot_loss_graph, write_10_fold_result, print_args
+from utils import *
 from models.graphegin import GraphEGIN
 import random
+import torch.nn.init as init
 
 criterion = nn.CrossEntropyLoss()
 
@@ -77,8 +78,11 @@ def val(model, train_graphs, val_graphs):
 
 
 def main(args):
-    seed = args.seed
 
+    if args.seed == -1:
+        args.seed = random.randint(0, 100000)
+
+    seed = args.seed
     random.seed(seed)  # set random seed to reproduce result
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -96,13 +100,19 @@ def main(args):
 
     train_loader = DataLoader(graphs[train_idx.tolist()], batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(graphs[val_idx.tolist()], batch_size=args.batch_size, shuffle=True)
-
     model = GraphEGIN(args.num_layers, args.num_mlp_layers, graphs.num_edge_features, graphs.num_node_features,
-                      args.hidden_dim, num_classes, args.final_dropout, args.learn_eps, args.dot_update, device).to(device)
+                      args.hidden_dim, num_classes, args.final_dropout, args.learn_eps, args.dot_update, args.edge_mlp, args.edge_hidden_dim, device).to(
+        device)
+
+    for param in model.parameters():
+        if len(param.shape) > 1:
+            init.xavier_uniform_(param)
 
     print_args(args)
-
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    print("==============================================================================================")
+    print("number of node feature:{}, number of edge feature:{}".format(graphs.num_node_features,graphs.num_edge_features))
+    print("==============================================================================================")
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.0001)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
     pbar = tqdm(range(args.epochs), unit='epochs', file=sys.stdout)
     date = str(time.strftime("%m_%d_%H_%M", time.localtime()))
@@ -141,7 +151,7 @@ def main(args):
             best_val_acc = acc_val
         if epoch % 5 == 0 and args.print_console:
             tqdm.write("epoch: %d, train loss = %.6f, val loss = %.6f, train acc = %.2f%% , val acc = %.2f%%" % (
-        epoch, avg_loss, val_loss, acc_train * 100, acc_val * 100))
+                epoch, avg_loss, val_loss, acc_train * 100, acc_val * 100))
         if args.output_file:
             with open(path + date + '_acc_results.txt', 'a+') as f:
                 f.write("epoch: %d, train loss = %.6f, val loss = %.6f, train acc = %.2f%% , val acc = %.2f%%\n" % (
@@ -156,9 +166,13 @@ def main(args):
         plot_loss_graph(all_train_loss[1:], all_val_loss[1:], date, path)
         plot_accu_graph(all_train_acc, all_val_acc, date, path)
 
-    print("best val acc: {} ".format(best_val_acc))
+    avg_20_loss = get_average(all_val_acc[-20:-1])
 
-    return best_val_acc
+    print("best val acc: {:.6f}\nlast val acc: {:.6f}\nlast 20 epochs avg acc: {:.6f}".format(best_val_acc*100,
+                                                                                                  all_val_acc[-1],
+                                                                                                  avg_20_loss))
+
+    return best_val_acc*100, all_val_acc[-1], avg_20_loss
 
 
 if __name__ == '__main__':
@@ -190,39 +204,55 @@ if __name__ == '__main__':
     parser.add_argument('--learn_eps', action="store_true",
                         help='Whether to learn the epsilon weighting for the center nodes. Does not affect training accuracy though.')
     parser.add_argument('--print_console', default=False, help='print result of each epoch on console')
-    parser.add_argument('--output_file', default=False, help='save results as a output file')
+    parser.add_argument('--output_file', default=False, help='save results to a output file')
     parser.add_argument('--plot_curve', default=False, help='plot loss and accuracy curves')
+    parser.add_argument('--edge_mlp', default=False, help='apply mlp to encode edge features')
+    parser.add_argument('--edge_hidden_dim', default=False, help='hidden dimension of mlp to encode edge features')
     args = parser.parse_args()
 
     # =======================================================================================================
-    # specify parameters here manually without using command line.
-    # 'Cuneiform','ER_MD','AIDS'
-    args.dataset = 'MUTAG'
+    # specify parameters manually here without using command line.
+    # Tox21_AR_evaluation
+    args.dataset = 'Tox21_ARE_evaluation'
     args.epochs = 200
-    args.batch_size = 64
+    args.batch_size = 32
     args.lr = 0.005
     args.fold_index = 10
-    args.learn_eps = False
+    args.seed = -1
+    args.learn_eps = True
     args.output_file = True
     args.plot_curve = True
     args.print_console = True
     args.num_layers = 5
-    args.hidden_dim = 32
+    args.hidden_dim = 128
     args.dot_update = False
+    args.final_dropout = 0.5
+    args.edge_mlp = True
+    args.edge_hidden_dim = 32
     # =======================================================================================================
+    if args.dot_update and args.edge_mlp:
+        raise Exception("dot_update and edge_mlp are both true, please set only one method as true")
 
-    if args.seed == -1:
-        args.seed = random.randint(0, 100000)
 
+    seed = args.seed
     best_acc = []
+    last_acc = []
+    avg_acc = []
     if args.fold_index == 10:
         for i in range(10):
             args.fold_index = i
-            best_acc.append(main(args))
-        print("10-fold mean:{}, std_dev:{}".format(np.mean(best_acc),np.std(best_acc)))
+            args.seed = seed
+            best, last, avg = main(args)
+            best_acc.append(best)
+            last_acc.append(last)
+            avg_acc.append(avg)
+        print("best val acc, 10-fold mean:{:.6f}, std_dev:{:.6f}".format(np.mean(best_acc), np.std(best_acc)))
+        print("last val acc, 10-fold mean:{:.6f}, std_dev:{:.6f}".format(np.mean(last_acc), np.std(last_acc)))
+        print(
+            "last 20 epochs avg val acc, 10-fold mean:{:.6f}, std_dev:{:.6f}".format(np.mean(avg_acc), np.std(avg_acc)))
 
         if args.output_file:
-            write_10_fold_result(args, best_acc)
+            write_10_fold_result(args, best_acc, last_acc, avg_acc)
 
     else:
         main(args)
