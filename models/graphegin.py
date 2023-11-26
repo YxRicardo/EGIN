@@ -8,7 +8,7 @@ from mlp import MLP
 import copy
 
 class GraphEGIN(nn.Module):
-    def __init__(self, num_layers, num_mlp_layers, num_edge_feat, input_dim, hidden_dim, output_dim, final_dropout, learn_eps,  dot_update, device):
+    def __init__(self, num_layers, num_mlp_layers, num_edge_feat, input_dim, hidden_dim, output_dim, final_dropout, learn_eps, dot_update, edge_mlp, edge_hidden_dim, device):
         '''
             num_layers: number of layers in the neural networks (INCLUDING the input layer)
             num_mlp_layers: number of layers in mlps (EXCLUDING the input layer)
@@ -35,26 +35,38 @@ class GraphEGIN(nn.Module):
         self.adj = None
         self.edge_rep = None
         self.edge_unit = None
+        self.edge_mlp = edge_mlp
+        self.edge_hidden_dim = edge_hidden_dim
+        if self.edge_mlp:
+            self.edge_mlps = torch.nn.ModuleList()
+            for layer in range(self.num_layers-1):
+                self.edge_mlps.append(torch.nn.Linear(num_edge_feat,self.edge_hidden_dim))
 
         ###List of batchnorms applied to the output of MLP (input of the final prediction linear layer)
+
         self.batch_norms = torch.nn.ModuleList()
 
-        if not self.dot_update:
+        if self.dot_update:
             for layer in range(self.num_layers-1):
                 if layer == 0:
                     self.mlps.append(MLP(num_mlp_layers, input_dim * num_edge_feat, hidden_dim, hidden_dim))
                 else:
                     self.mlps.append(MLP(num_mlp_layers, hidden_dim * num_edge_feat, hidden_dim, hidden_dim))
-
                 self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
 
-        else:
+        elif not self.edge_mlp:
             for layer in range(self.num_layers - 1):
                 if layer == 0:
                     self.mlps.append(MLP(num_mlp_layers, input_dim + num_edge_feat, hidden_dim, hidden_dim))
                 else:
                     self.mlps.append(MLP(num_mlp_layers, hidden_dim + num_edge_feat, hidden_dim, hidden_dim))
-
+                self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
+        else:
+            for layer in range(self.num_layers - 1):
+                if layer == 0:
+                    self.mlps.append(MLP(num_mlp_layers, input_dim + self.edge_hidden_dim, hidden_dim, hidden_dim))
+                else:
+                    self.mlps.append(MLP(num_mlp_layers, hidden_dim + self.edge_hidden_dim, hidden_dim, hidden_dim))
                 self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
 
 
@@ -81,7 +93,7 @@ class GraphEGIN(nn.Module):
         for i in range(batch.num_edges):
             adj[batch.edge_index[0][i]][batch.edge_index[1][i]] = batch.edge_attr[i]
 
-        if self.dot_update:
+        if not self.dot_update:
             self.edge_rep = torch.sum(adj,dim=1).to(self.device)
 
             adj = torch.eye(batch.num_nodes, batch.num_nodes)
@@ -105,17 +117,19 @@ class GraphEGIN(nn.Module):
 
 
     def egin_next_layer(self, h, layer):
-        if not self.dot_update:
+        if self.dot_update:
         ###pooling neighboring nodes and center nodes altogether
             pooled = self.embedadj_mm(self.adj, h)
-
-        else:
+        elif not self.edge_mlp:
             pooled = torch.cat((torch.spmm(self.adj, h), self.edge_rep),dim=1)
+        else:
+            pooled = torch.cat((torch.spmm(self.adj, h), self.edge_mlps[layer](self.edge_rep)), dim=1)
 
         # representation of neighboring and center nodes
         pooled_rep = self.mlps[layer](pooled)
 
         h = self.batch_norms[layer](pooled_rep)
+
 
         # non-linearity
         h = F.relu(h)
@@ -124,7 +138,7 @@ class GraphEGIN(nn.Module):
 
     def egin_next_layer_eps(self, h, layer, batch):
         ###pooling neighboring nodes and center nodes altogether
-        if not self.dot_update:
+        if self.dot_update:
             adj = copy.deepcopy(self.adj)
             if batch.num_edge_features == 1:
                 adj = adj + torch.eye(batch.num_nodes, batch.num_nodes).to(self.device) * self.eps[layer]
@@ -134,13 +148,18 @@ class GraphEGIN(nn.Module):
 
             pooled = self.embedadj_mm(adj, h)
 
-        else:
+        elif not self.edge_mlp:
             pooled = torch.cat((torch.spmm(self.adj, h), self.edge_rep), dim=1) + torch.cat((h,self.edge_unit),dim=1) * self.eps[layer]
+
+        else:
+            pooled = torch.cat((torch.spmm(self.adj, h), self.edge_mlps[layer](self.edge_rep)), dim=1) + torch.cat((h, self.edge_mlps[layer](self.edge_unit)),
+                                                                                            dim=1) * self.eps[layer]
 
         pooled_rep = self.mlps[layer](pooled)
 
 
         h = self.batch_norms[layer](pooled_rep)
+
 
         # non-linearity
         h = F.relu(h)
