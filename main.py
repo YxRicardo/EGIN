@@ -172,7 +172,7 @@ def main(args):
                                                                                                   all_val_acc[-1],
                                                                                                   avg_20_loss))
 
-    return best_val_acc*100, all_val_acc[-1], avg_20_loss
+    return best_val_acc*100, all_val_acc[-1], avg_20_loss, model
 
 
 if __name__ == '__main__':
@@ -213,21 +213,21 @@ if __name__ == '__main__':
     # =======================================================================================================
     # specify parameters manually here without using command line.
     # Tox21_AR_evaluation
-    args.dataset = 'Tox21_ARE_evaluation'
-    args.epochs = 200
-    args.batch_size = 32
+    args.dataset = 'MUTAG'
+    args.epochs = 100
+    args.batch_size = 4
     args.lr = 0.005
-    args.fold_index = 10
+    args.fold_index = 3
     args.seed = -1
-    args.learn_eps = True
-    args.output_file = True
-    args.plot_curve = True
+    args.learn_eps = False
+    args.output_file = False
+    args.plot_curve = False
     args.print_console = True
-    args.num_layers = 5
-    args.hidden_dim = 128
+    args.num_layers = 3
+    args.hidden_dim = 32
     args.dot_update = False
-    args.final_dropout = 0.5
-    args.edge_mlp = True
+    args.final_dropout = 0.2
+    args.edge_mlp = False
     args.edge_hidden_dim = 32
     # =======================================================================================================
     if args.dot_update and args.edge_mlp:
@@ -242,7 +242,7 @@ if __name__ == '__main__':
         for i in range(10):
             args.fold_index = i
             args.seed = seed
-            best, last, avg = main(args)
+            best, last, avg, _ = main(args)
             best_acc.append(best)
             last_acc.append(last)
             avg_acc.append(avg)
@@ -255,4 +255,5 @@ if __name__ == '__main__':
             write_10_fold_result(args, best_acc, last_acc, avg_acc)
 
     else:
-        main(args)
+        _,_,_, model = main(args)
+        torch.save(model.state_dict(), 'EGIN.pth')
